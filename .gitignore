@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dados
+data/raw/*
+data/interim/*
+data/processed/*
+
+# Mantém as pastas no Git
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Outputs pesados
+outputs/models/*
+outputs/metrics/*
+outputs/figures/*
+
+!outputs/models/.gitkeep
+!outputs/metrics/.gitkeep
+!outputs/figures/.gitkeep
+
+# Sistema
+.DS_Store
+Thumbs.db
