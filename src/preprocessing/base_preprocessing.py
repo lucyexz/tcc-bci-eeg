@@ -8,26 +8,47 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
+from src.constants import LABEL_COLUMN, USER_COLUMN
 from src.data.loader import load_all_users
 
-
-LABEL_COLUMN = "Values"
-USER_COLUMN = "user"
-
 OutlierStrategy = Literal["none", "clip_iqr"]
+SplitStrategy = Literal["chronological", "random"]
 
 
 @dataclass
 class BasePreprocessingConfig:
     test_size: float = 0.2
     random_state: int = 42
-    stratify: bool = True
     remove_duplicates: bool = True
     handle_missing: bool = True
     imputation_strategy: str = "median"
     outlier_strategy: OutlierStrategy = "clip_iqr"
-    iqr_multiplier: float = 1.5
+    iqr_multiplier: float = 2.5
     scale_data: bool = True
+    split_strategy: SplitStrategy = "random"
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.test_size < 1.0):
+            raise ValueError(
+                f"`test_size` deve estar entre 0 e 1 (exclusivo), "
+                f"recebido: {self.test_size}"
+            )
+        if self.iqr_multiplier < 0:
+            raise ValueError(
+                f"`iqr_multiplier` deve ser >= 0, "
+                f"recebido: {self.iqr_multiplier}"
+            )
+        valid_strategies = {"mean", "median", "most_frequent", "constant"}
+        if self.imputation_strategy not in valid_strategies:
+            raise ValueError(
+                f"`imputation_strategy` inválida: '{self.imputation_strategy}'. "
+                f"Opções válidas: {valid_strategies}"
+            )
+        if self.split_strategy not in {"chronological", "random"}:
+            raise ValueError(
+                f"`split_strategy` inválida: '{self.split_strategy}'. "
+                "Opções válidas: 'chronological', 'random'"
+            )
 
 
 @dataclass
@@ -44,8 +65,8 @@ class BasePreprocessingResult:
     scaler: StandardScaler | None
     imputer: SimpleImputer | None
 
-    train_dataframe: pd.DataFrame
-    test_dataframe: pd.DataFrame
+    processed_train_dataframe: pd.DataFrame
+    processed_test_dataframe: pd.DataFrame
 
     preprocessing_report: dict
 
@@ -92,10 +113,21 @@ def validate_numeric_features(
         )
 
 
+def validate_labels_are_whole_numbers(df: pd.DataFrame) -> None:
+    label_series = df[LABEL_COLUMN]
+    fractional_mask = label_series.apply(lambda v: float(v) != int(float(v)))
+    bad_values = label_series[fractional_mask].unique().tolist()
+    if bad_values:
+        raise ValueError(
+            f"Labels com parte fracionária encontradas: {bad_values}. "
+            "Labels devem ser inteiros exatos (0, 1 ou 2)."
+        )
+
+
 def validate_labels(df: pd.DataFrame) -> None:
     valid_labels = {0, 1, 2}
 
-    labels = set(df[LABEL_COLUMN].dropna().astype(int).unique())
+    labels = set(df[LABEL_COLUMN].unique())
 
     invalid_labels = labels - valid_labels
 
@@ -114,6 +146,54 @@ def remove_rows_without_label_or_user(df: pd.DataFrame) -> tuple[pd.DataFrame, i
     removed_rows = before_rows - len(df_clean)
 
     return df_clean, removed_rows
+
+
+def random_stratified_split(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    test_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    X = df[feature_columns].to_numpy()
+    y = df[LABEL_COLUMN].to_numpy()
+    users = df[USER_COLUMN].to_numpy()
+
+    X_train, X_test, y_train, y_test, users_train, users_test = train_test_split(
+        X, y, users,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,
+    )
+
+    return X_train, X_test, y_train, y_test, users_train, users_test
+
+
+def chronological_split_by_user(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    test_size: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train_parts: list[pd.DataFrame] = []
+    test_parts: list[pd.DataFrame] = []
+
+    for user in sorted(df[USER_COLUMN].unique()):
+        user_df = df[df[USER_COLUMN] == user]
+        n_train = int(len(user_df) * (1 - test_size))
+        train_parts.append(user_df.iloc[:n_train])
+        test_parts.append(user_df.iloc[n_train:])
+
+    train_df = pd.concat(train_parts, ignore_index=True)
+    test_df = pd.concat(test_parts, ignore_index=True)
+
+    X_train = train_df[feature_columns].to_numpy()
+    y_train = train_df[LABEL_COLUMN].to_numpy()
+    users_train = train_df[USER_COLUMN].to_numpy()
+
+    X_test = test_df[feature_columns].to_numpy()
+    y_test = test_df[LABEL_COLUMN].to_numpy()
+    users_test = test_df[USER_COLUMN].to_numpy()
+
+    return X_train, X_test, y_train, y_test, users_train, users_test
 
 
 def remove_duplicate_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -181,6 +261,8 @@ def prepare_base_data(
 
     report["removed_rows_without_label_or_user"] = removed_rows_without_label_or_user
 
+    validate_labels_are_whole_numbers(df)
+
     df[LABEL_COLUMN] = df[LABEL_COLUMN].astype(int)
     df[USER_COLUMN] = df[USER_COLUMN].astype(str)
 
@@ -197,21 +279,25 @@ def prepare_base_data(
 
     report["removed_duplicates"] = removed_duplicates
     report["shape_after_cleaning"] = df.shape
+    report["split_strategy"] = config.split_strategy
+    report["test_size"] = config.test_size
 
-    X = df[feature_columns].to_numpy()
-    y = df[LABEL_COLUMN].to_numpy()
-    users = df[USER_COLUMN].to_numpy()
+    if config.split_strategy == "random":
+        X_train, X_test, y_train, y_test, users_train, users_test = random_stratified_split(
+            df,
+            feature_columns,
+            config.test_size,
+            config.random_state,
+        )
+    else:
+        X_train, X_test, y_train, y_test, users_train, users_test = chronological_split_by_user(
+            df,
+            feature_columns,
+            config.test_size,
+        )
 
-    stratify_values = y if config.stratify else None
-
-    X_train, X_test, y_train, y_test, users_train, users_test = train_test_split(
-        X,
-        y,
-        users,
-        test_size=config.test_size,
-        random_state=config.random_state,
-        stratify=stratify_values,
-    )
+    report["missing_values_before_imputation_train"] = int(np.isnan(X_train).sum())
+    report["missing_values_before_imputation_test"] = int(np.isnan(X_test).sum())
 
     imputer = None
 
@@ -233,6 +319,23 @@ def prepare_base_data(
 
     report["missing_values_after_imputation_train"] = int(np.isnan(X_train).sum())
     report["missing_values_after_imputation_test"] = int(np.isnan(X_test).sum())
+
+    report["class_distribution_train"] = {
+        int(label): int((y_train == label).sum())
+        for label in sorted(np.unique(y_train))
+    }
+    report["class_distribution_test"] = {
+        int(label): int((y_test == label).sum())
+        for label in sorted(np.unique(y_test))
+    }
+    report["samples_per_user_train"] = {
+        user: int((users_train == user).sum())
+        for user in sorted(np.unique(users_train))
+    }
+    report["samples_per_user_test"] = {
+        user: int((users_test == user).sum())
+        for user in sorted(np.unique(users_test))
+    }
 
     if config.outlier_strategy == "clip_iqr":
         lower_bound, upper_bound = calculate_iqr_bounds(
@@ -266,14 +369,14 @@ def prepare_base_data(
     report["final_train_shape"] = X_train.shape
     report["final_test_shape"] = X_test.shape
 
-    train_dataframe = build_dataframe(
+    processed_train_dataframe = build_dataframe(
         X=X_train,
         y=y_train,
         users=users_train,
         feature_columns=feature_columns,
     )
 
-    test_dataframe = build_dataframe(
+    processed_test_dataframe = build_dataframe(
         X=X_test,
         y=y_test,
         users=users_test,
@@ -290,7 +393,7 @@ def prepare_base_data(
         feature_columns=feature_columns,
         scaler=scaler,
         imputer=imputer,
-        train_dataframe=train_dataframe,
-        test_dataframe=test_dataframe,
+        processed_train_dataframe=processed_train_dataframe,
+        processed_test_dataframe=processed_test_dataframe,
         preprocessing_report=report,
     )

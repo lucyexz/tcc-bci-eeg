@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.constants import LABEL_COLUMN, USER_COLUMN
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
@@ -52,7 +54,7 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     removendo label e identificação do usuário.
     """
 
-    ignored_columns = ["Values", "user"]
+    ignored_columns = {LABEL_COLUMN, USER_COLUMN}
 
     return [col for col in df.columns if col not in ignored_columns]
 
@@ -67,6 +69,6 @@ def get_features_and_labels(df: pd.DataFrame):
     feature_columns = get_feature_columns(df)
 
     X = df[feature_columns]
-    y = df["Values"]
+    y = df[LABEL_COLUMN]
 
     return X, y
