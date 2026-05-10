@@ -111,6 +111,32 @@ Acesse: `http://localhost:5173`
 
 ---
 
+## 7. Simulação Pygame
+
+Demonstração interativa onde um modelo BCI controla um veículo 2D em tempo real.
+
+### Modo mock (sem modelo, abre imediatamente)
+
+    python -m src.simulation.pygame_simulator
+
+### Modo real (requer `outputs/models/` e `data/processed/`)
+
+    python -m src.simulation.pygame_simulator --model cnn --no-mock
+    python -m src.simulation.pygame_simulator --model lstm --no-mock
+    python -m src.simulation.pygame_simulator --model gru --no-mock
+    python -m src.simulation.pygame_simulator --model transformer --no-mock
+
+### Controles
+
+Tecla | Ação
+--- | ---
+`SPACE` | Pausar / retomar (congela tudo)
+`F` | Congelar dados EEG — o veículo continua se movendo com o último comando; permite analisar por que ele fez o que fez
+`R` | Resetar veículo ao centro
+`ESC` | Sair
+
+---
+
 ## Resultados
 
 Modelo | Test Accuracy | Test Loss
