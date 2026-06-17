@@ -148,5 +148,3 @@ CNN | **72.21%** | 0.6253
 Bi-GRU | 69.58% | 0.6702
 Bi-LSTM | 67.32% | 0.7024
 Transformer | 66.46% | 0.7195
-
-Baseline do professor: **61.2%** — todos os modelos superam o baseline.
