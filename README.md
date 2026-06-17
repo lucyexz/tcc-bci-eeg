@@ -1,8 +1,6 @@
 # BCI EEG — Classificação de Sinais EEG com Deep Learning
 
-Projeto de TCC que compara modelos de deep learning (CNN, Bi-LSTM, Bi-GRU e Transformer) para classificação de intenção motora a partir de sinais EEG de 5 eletrodos.
-
-> Documentação completa do projeto: [PROJECT.md](PROJECT.md)
+Projeto de TCC que compara modelos de deep learning (CNN, Bi-LSTM, Bi-GRU e Transformer) para classificação de intenção motora a partir de sinais EEG de 5 eletrodos (AF3, T7, Pz, T8, AF4).
 
 ---
 
@@ -41,7 +39,9 @@ O prompt do terminal muda para `(.venv)` confirmando a ativação.
 
 ## 3. Instalar dependências Python
 
-    pip install tensorflow keras numpy pandas scikit-learn scipy matplotlib seaborn jupyterlab
+    pip install -r requirements.txt
+
+> Inclui TensorFlow, NumPy, pandas, scikit-learn, scipy, matplotlib, seaborn, JupyterLab e pygame (necessário para a simulação).
 
 ---
 
@@ -93,6 +93,7 @@ O dashboard visualiza as métricas de todos os modelos treinados.
 Certifique-se de que o ambiente virtual está ativo, depois:
 
     cd dashboard\backend
+    pip install -r requirements.txt
     python main.py
 
 O backend sobe em:
@@ -113,7 +114,7 @@ Acesse: `http://localhost:5173`
 
 ## 7. Simulação Pygame
 
-Demonstração interativa onde um modelo BCI controla um veículo 2D em tempo real.
+Demonstração interativa onde um modelo BCI controla um veículo 2D em tempo real (janela 1280×720).
 
 ### Modo mock (sem modelo, abre imediatamente)
 
@@ -125,6 +126,8 @@ Demonstração interativa onde um modelo BCI controla um veículo 2D em tempo re
     python -m src.simulation.pygame_simulator --model lstm --no-mock
     python -m src.simulation.pygame_simulator --model gru --no-mock
     python -m src.simulation.pygame_simulator --model transformer --no-mock
+
+Use `--data-path <caminho>` para apontar para um diretório `data/processed/` alternativo.
 
 ### Controles
 

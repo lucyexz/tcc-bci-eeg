@@ -5,8 +5,8 @@ import pygame
 
 from src.simulation.config import SimulationConfig
 
-_CHANNELS = ("AF3", "AF4", "T7", "T8", "Pz")
-_BANDS = ("Delta", "Theta", "Alpha", "Beta", "Gamma")
+_CHANNELS = ("AF3", "T7", "Pz", "T8", "AF4")
+_BANDS = ("Theta", "Alpha", "BetaL", "BetaH", "Gamma")
 
 
 def _coolwarm(v: float) -> tuple[int, int, int]:
