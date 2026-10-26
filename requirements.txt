@@ -1,0 +1,9 @@
+tensorflow
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+seaborn
+jupyterlab
+pygame>=2.5
