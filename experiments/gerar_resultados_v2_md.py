@@ -778,7 +778,7 @@ def section_limitations() -> list[str]:
 
 def section_next() -> list[str]:
     return [
-        "## Próximos passos (v3) — frentes congeladas nesta iteração",
+        "## Próximos passos — frentes congeladas nesta iteração",
         "",
         "Por decisão de escopo, a v2 mexeu **apenas na representação dos dados**. Ficam registradas, "
         "para a próxima iteração e cada uma medida isoladamente:",

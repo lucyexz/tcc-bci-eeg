@@ -13,10 +13,10 @@ from src.data.loader import load_all_users
 from src.features.spectral_features import FEATURE_SETS, transform_features
 
 OutlierStrategy = Literal["none", "clip_iqr"]
-SplitStrategy = Literal["chronological", "random", "blocked_cv", "loso"]
+SplitStrategy = Literal["chronological", "random", "blocked_cv"]
 Normalization = Literal["global", "per_subject"]
 
-SPLIT_STRATEGIES = {"chronological", "random", "blocked_cv", "loso"}
+SPLIT_STRATEGIES = {"chronological", "random", "blocked_cv"}
 NORMALIZATIONS = {"global", "per_subject"}
 
 
@@ -28,7 +28,7 @@ class BasePreprocessingConfig:
     handle_missing: bool = True
     imputation_strategy: str = "median"
     outlier_strategy: OutlierStrategy = "clip_iqr"
-    iqr_multiplier: float = 2.5
+    iqr_multiplier: float = 1.5
     scale_data: bool = True
     split_strategy: SplitStrategy = "random"
     subject: str | None = None
@@ -58,16 +58,6 @@ class BasePreprocessingConfig:
     # "previous" (fold anterior, circular). Usado no diagnóstico sobre a
     # proximidade temporal entre validação e teste.
     cv_val_position: str = "next"
-
-    # Leave-one-subject-out (split_strategy="loso"). `loso_test_subject` fica
-    # inteiro no teste e nunca aparece no treino. Com `validation_size > 0`,
-    # `loso_val_subject` (padrão: o sujeito seguinte, circular) fica inteiro
-    # na validação, para o EarlyStopping escolher os pesos pelo que generaliza
-    # para uma pessoa não vista. `test_size` e o valor de `validation_size`
-    # são ignorados nesse modo. O leave-one-trial-out não precisa de modo
-    # próprio: é o "blocked_cv" com `cv_n_folds=12` (1 ciclo E→D→N por fold).
-    loso_test_subject: str | None = None
-    loso_val_subject: str | None = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.validation_size < 1.0):
@@ -126,20 +116,6 @@ class BasePreprocessingConfig:
             raise ValueError(
                 f"`purge_samples` deve ser >= 0, recebido: {self.purge_samples}"
             )
-        if self.split_strategy == "loso":
-            if self.loso_test_subject is None:
-                raise ValueError(
-                    "`split_strategy='loso'` exige `loso_test_subject`."
-                )
-            if self.subject is not None:
-                raise ValueError(
-                    "`split_strategy='loso'` é do modelo agrupado e não pode "
-                    "ser combinado com `subject`."
-                )
-            if self.loso_val_subject == self.loso_test_subject:
-                raise ValueError(
-                    "`loso_val_subject` não pode ser o sujeito de teste."
-                )
 
 
 @dataclass
@@ -527,64 +503,6 @@ def blocked_cv_split(
     )
 
 
-def loso_split(
-    df: pd.DataFrame,
-    test_subject: str,
-    val_subject: str | None,
-    use_validation: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-    """Leave-one-subject-out: um sujeito inteiro no teste.
-
-    Com validação, outro sujeito inteiro (`val_subject`, ou o seguinte ao de
-    teste na ordem alfabética, circular) sai do treino e vira validação. O
-    treino fica com os sujeitos restantes. Não há purge: partições de
-    sujeitos diferentes não têm vizinhança temporal.
-
-    Returns:
-        (índices de treino, índices de validação, índices de teste, info)
-    """
-    users = df[USER_COLUMN].to_numpy()
-    subjects = sorted(np.unique(users).tolist())
-
-    if test_subject not in subjects:
-        raise ValueError(
-            f"Sujeito de teste '{test_subject}' não encontrado. "
-            f"Disponíveis: {subjects}"
-        )
-
-    if not use_validation:
-        val_subject = None
-    elif val_subject is None:
-        val_subject = subjects[(subjects.index(test_subject) + 1) % len(subjects)]
-    elif val_subject not in subjects:
-        raise ValueError(
-            f"Sujeito de validação '{val_subject}' não encontrado. "
-            f"Disponíveis: {subjects}"
-        )
-
-    is_test = users == test_subject
-    is_val = (
-        users == val_subject
-        if val_subject is not None
-        else np.zeros_like(is_test)
-    )
-
-    info = {
-        "loso_test_subject": test_subject,
-        "loso_val_subject": val_subject,
-        "loso_train_subjects": [
-            s for s in subjects if s not in (test_subject, val_subject)
-        ],
-    }
-
-    return (
-        np.flatnonzero(~is_test & ~is_val),
-        np.flatnonzero(is_val),
-        np.flatnonzero(is_test),
-        info,
-    )
-
-
 def remove_duplicate_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     before_rows = len(df)
 
@@ -636,18 +554,13 @@ def _per_subject(
     X_train: np.ndarray,
     users_train: np.ndarray,
     others: list[tuple[np.ndarray, np.ndarray]],
-    fit_unseen_on_self: bool = False,
 ):
     """Aplica `fit_fn` sujeito a sujeito: ajusta no treino, transforma o resto.
 
     `fit_fn(X_user_train)` devolve uma função `transform(X)`. Retorna os
     arrays transformados (treino primeiro, depois `others` na mesma ordem) e
-    o dict sujeito → objeto ajustado.
-
-    `fit_unseen_on_self` trata o sujeito que não tem treino (LOSO): em vez de
-    erro, o ajuste é feito nas amostras dele naquela partição. Só as features
-    entram na conta, nunca os rótulos — é uma calibração não supervisionada
-    do usuário novo, e precisa ser declarada como tal em qualquer resultado.
+    o dict sujeito → objeto ajustado. Todo sujeito avaliado precisa ter
+    dados de treino.
     """
     X_train_out = np.empty_like(X_train, dtype=float)
     others_out = [np.empty_like(X, dtype=float) for X, _ in others]
@@ -664,18 +577,13 @@ def _per_subject(
             if other_mask.any():
                 out[other_mask] = transform(X[other_mask])
 
-    for (X, users), out in zip(others, others_out):
+    for _, users in others:
         unseen = set(np.unique(users)) - set(np.unique(users_train))
-        if unseen and not fit_unseen_on_self:
+        if unseen:
             raise ValueError(
                 "normalization='per_subject' exige que todo sujeito avaliado "
                 f"tenha dados de treino; sem treino: {sorted(unseen)}"
             )
-        for user in sorted(unseen):
-            mask = users == user
-            transform, state = fit_fn(X[mask])
-            fitted[str(user)] = state
-            out[mask] = transform(X[mask])
 
     return X_train_out, others_out, fitted
 
@@ -778,17 +686,6 @@ def prepare_base_data(
             )
             train_idx, val_idx = train_idx[inner_train], train_idx[inner_val]
 
-    elif config.split_strategy == "loso":
-        train_idx, val_idx, test_idx, loso_info = loso_split(
-            df,
-            test_subject=config.loso_test_subject,
-            val_subject=config.loso_val_subject,
-            use_validation=use_validation,
-        )
-        report.update(loso_info)
-        if not use_validation:
-            val_idx = None
-
     else:
         train_idx, val_idx, test_idx, cv_info = blocked_cv_split(
             df,
@@ -890,12 +787,6 @@ def prepare_base_data(
     if X_val is not None:
         others.append((X_val, users_val))
 
-    # No LOSO os sujeitos de teste e validação não têm treino: a normalização
-    # por sujeito deles é ajustada nas próprias amostras, sem rótulos.
-    fit_unseen_on_self = config.split_strategy == "loso"
-    if fit_unseen_on_self and config.normalization == "per_subject":
-        report["unseen_subject_normalization"] = "transductive_unlabeled"
-
     def unpack(others_out):
         test = others_out[0]
         val = others_out[1] if X_val is not None else None
@@ -922,7 +813,7 @@ def prepare_base_data(
                 return (lambda X: clip_outliers(X, lower, upper)), (lower, upper)
 
             X_train, others_out, _ = _per_subject(
-                fit_iqr, X_train, users_train, others, fit_unseen_on_self
+                fit_iqr, X_train, users_train, others
             )
             X_test, X_val = unpack(others_out)
             others = [(X_test, users_test)]
@@ -958,7 +849,7 @@ def prepare_base_data(
                 return user_scaler.transform, user_scaler
 
             X_train, others_out, scaler = _per_subject(
-                fit_scaler, X_train, users_train, others, fit_unseen_on_self
+                fit_scaler, X_train, users_train, others
             )
             X_test, X_val = unpack(others_out)
 

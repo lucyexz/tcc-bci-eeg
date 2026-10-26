@@ -653,7 +653,7 @@ def section_limitations() -> list[str]:
         "`n_frames=1`). Incorporar janelas deslizantes é um experimento subsequente e "
         "está fora do escopo desta etapa.",
         "",
-        "6. **Sem validação leave-one-subject-out.** A capacidade de generalização "
+        "6. **Sem avaliação com participante inteiro fora do treino.** A capacidade de generalização "
         "para um sujeito completamente novo — cenário mais exigente e mais próximo do "
         "uso real de uma BCI — não é avaliada aqui, e fica como trabalho futuro. "
         "Dado o desempenho do modelo agrupado, a expectativa é que esse cenário seja "

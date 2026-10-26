@@ -70,29 +70,6 @@ def assert_no_leakage(prep, config) -> None:
                 f"esperado ['{config.subject}'], encontrado {found}"
             )
 
-    # 1b. No LOSO nenhum sujeito pode aparecer em duas partições, e o teste
-    #     tem que ser exatamente o sujeito deixado de fora.
-    if config.split_strategy == "loso":
-        subjects = {
-            name: set(np.unique(users).tolist())
-            for name, users in partitions.items()
-        }
-        assert subjects["teste"] == {config.loso_test_subject}, (
-            f"LOSO: teste deveria conter só '{config.loso_test_subject}', "
-            f"encontrado {sorted(subjects['teste'])}"
-        )
-        names = list(subjects)
-        for i, first in enumerate(names):
-            for second in names[i + 1:]:
-                shared = subjects[first] & subjects[second]
-                assert not shared, (
-                    f"LOSO: sujeito(s) {sorted(shared)} em '{first}' E '{second}'"
-                )
-        print(
-            "  [ok] LOSO: sujeitos disjuntos — "
-            + " | ".join(f"{name} {sorted(s)}" for name, s in subjects.items())
-        )
-
     # 2. As partições precisam formar uma partição exata das linhas limpas.
     #    Todos os splits são construídos por índice (`iloc` no corte
     #    cronológico, `flatnonzero` no carve de validação), então se as
@@ -183,25 +160,10 @@ def assert_no_leakage(prep, config) -> None:
             f"O treino deveria estar centrado em 0, mas o desvio máximo "
             f"da média é {train_mean:.2e}"
         )
-        # Exceção declarada: no LOSO com normalização por sujeito, o scaler do
-        # sujeito de teste é ajustado nas features dele (sem rótulos), então a
-        # média do teste é 0 por construção.
-        transductive = (
-            config.split_strategy == "loso"
-            and getattr(config, "normalization", "global") == "per_subject"
+        assert test_mean > 1e-6, (
+            "A média do teste é exatamente 0, o que indica que o scaler foi "
+            "ajustado incluindo o teste (vazamento)"
         )
-
-        if transductive:
-            print(
-                "  [aviso] LOSO + normalização por sujeito: scaler do sujeito "
-                "de teste ajustado nas próprias features, SEM rótulos "
-                "(calibração não supervisionada)"
-            )
-        else:
-            assert test_mean > 1e-6, (
-                "A média do teste é exatamente 0, o que indica que o scaler foi "
-                "ajustado incluindo o teste (vazamento)"
-            )
 
         if getattr(config, "normalization", "global") == "per_subject":
             for user in np.unique(prep.users_train):
@@ -266,8 +228,6 @@ def save_report(prep, config, out_dir: Path) -> None:
 
     if prep.X_val is None:
         validation_source = "keras_validation_split"
-    elif config.split_strategy == "loso":
-        validation_source = "sujeito_de_treino_inteiro"
     elif config.split_strategy == "blocked_cv":
         validation_source = "fold_vizinho"
     else:
