@@ -21,6 +21,11 @@ class LSTMConfig:
     validation_split: float = 0.2
     random_state: int = 42
     use_class_weights: bool = True
+    # Mapas 5×5 por amostra (1 = v1). Cada passo (banda) passa a carregar
+    # 5·k features: os 5 canais de cada mapa.
+    n_feature_maps: int = 1
+    # Verbosidade do model.fit (1 = barra de progresso; 2 = uma linha por época).
+    verbose: int = 1
 
 
 @dataclass
@@ -49,6 +54,11 @@ class GRUConfig:
     validation_split: float = 0.2
     random_state: int = 42
     use_class_weights: bool = True
+    # Mapas 5×5 por amostra (1 = v1). Cada passo (banda) passa a carregar
+    # 5·k features: os 5 canais de cada mapa.
+    n_feature_maps: int = 1
+    # Verbosidade do model.fit (1 = barra de progresso; 2 = uma linha por época).
+    verbose: int = 1
 
 
 @dataclass
@@ -65,13 +75,16 @@ class GRUResult:
 
 def reshape_for_lstm(X: np.ndarray) -> np.ndarray:
     """
-    (N, 25) → (N, 5, 5): 5 bands as timesteps, 5 channels as features.
+    (N, 25·k) → (N, 5, 5·k): 5 bands as timesteps, 5 channels (× k maps) as features.
 
-    Column layout is channel-major: [AF3_Theta…AF3_Gamma, AF4_Theta…Pz_Gamma].
-    reshape(-1, 5, 5) gives (N, 5_channels, 5_bands).
-    Transpose to (N, 5_bands, 5_channels) so LSTM processes frequency bands sequentially.
+    Column layout is map-major, then channel-major (AF3, T7, Pz, T8, AF4) with
+    the 5 bands inside each channel. reshape(-1, k, 5, 5) gives
+    (N, maps, channels, bands); bands are moved to the time axis so the LSTM
+    processes frequency bands sequentially. With k=1 this is identical to v1.
     """
-    return X.reshape(-1, 5, 5).transpose(0, 2, 1)
+    n_maps = X.shape[-1] // 25
+    grid = X.reshape(-1, n_maps, 5, 5).transpose(0, 3, 1, 2)
+    return grid.reshape(-1, 5, 5 * n_maps)
 
 
 def _wrap_bidirectional(rnn_layer: layers.Layer, bidirectional: bool) -> layers.Layer:
@@ -101,7 +114,7 @@ def build_lstm_model(config: LSTMConfig) -> keras.Sequential:
         ]
 
     model = keras.Sequential([
-        layers.Input(shape=(5, 5)),
+        layers.Input(shape=(5, 5 * config.n_feature_maps)),
         *rnn_layers,
         *hidden_layers,
         layers.Dense(3, activation="softmax"),
@@ -130,7 +143,7 @@ def build_gru_model(config: GRUConfig) -> keras.Sequential:
         ]
 
     model = keras.Sequential([
-        layers.Input(shape=(5, 5)),
+        layers.Input(shape=(5, 5 * config.n_feature_maps)),
         *rnn_layers,
         *hidden_layers,
         layers.Dense(3, activation="softmax"),
@@ -151,9 +164,16 @@ def _fit(
     validation_split: float,
     use_class_weights: bool,
     random_state: int,
+    validation_data: tuple[np.ndarray, np.ndarray] | None = None,
+    verbose: int = 1,
 ) -> tuple:
     tf.random.set_seed(random_state)
     np.random.seed(random_state)
+
+    if validation_data is not None:
+        fit_kwargs = {"validation_data": validation_data}
+    else:
+        fit_kwargs = {"validation_split": validation_split}
 
     class_weight = None
     if use_class_weights:
@@ -185,12 +205,12 @@ def _fit(
     history = model.fit(
         X_train,
         y_train,
-        validation_split=validation_split,
+        **fit_kwargs,
         epochs=epochs,
         batch_size=batch_size,
         callbacks=[early_stopping, lr_scheduler],
         class_weight=class_weight,
-        verbose=1,
+        verbose=verbose,
     )
 
     test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
@@ -206,12 +226,17 @@ def train_lstm(
     X_test: np.ndarray,
     y_test: np.ndarray,
     config: LSTMConfig | None = None,
+    validation_data: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> LSTMResult:
     if config is None:
         config = LSTMConfig()
 
     X_train_lstm = reshape_for_lstm(X_train)
     X_test_lstm = reshape_for_lstm(X_test)
+
+    if validation_data is not None:
+        X_val, y_val = validation_data
+        validation_data = (reshape_for_lstm(X_val), y_val)
 
     model = build_lstm_model(config)
     history, y_pred, y_pred_proba, test_loss, test_accuracy = _fit(
@@ -225,6 +250,8 @@ def train_lstm(
         validation_split=config.validation_split,
         use_class_weights=config.use_class_weights,
         random_state=config.random_state,
+        validation_data=validation_data,
+        verbose=config.verbose,
     )
 
     return LSTMResult(
@@ -245,12 +272,17 @@ def train_gru(
     X_test: np.ndarray,
     y_test: np.ndarray,
     config: GRUConfig | None = None,
+    validation_data: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> GRUResult:
     if config is None:
         config = GRUConfig()
 
     X_train_gru = reshape_for_lstm(X_train)
     X_test_gru = reshape_for_lstm(X_test)
+
+    if validation_data is not None:
+        X_val, y_val = validation_data
+        validation_data = (reshape_for_lstm(X_val), y_val)
 
     model = build_gru_model(config)
     history, y_pred, y_pred_proba, test_loss, test_accuracy = _fit(
@@ -264,6 +296,8 @@ def train_gru(
         validation_split=config.validation_split,
         use_class_weights=config.use_class_weights,
         random_state=config.random_state,
+        validation_data=validation_data,
+        verbose=config.verbose,
     )
 
     return GRUResult(

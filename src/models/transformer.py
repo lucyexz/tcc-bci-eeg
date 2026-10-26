@@ -22,6 +22,11 @@ class TransformerConfig:
     validation_split: float = 0.2
     random_state: int = 42
     use_class_weights: bool = True
+    # Mapas 5×5 por amostra (1 = v1). Cada token (canal) passa a carregar
+    # 5·k features: as 5 bandas de cada mapa.
+    n_feature_maps: int = 1
+    # Verbosidade do model.fit (1 = barra de progresso; 2 = uma linha por época).
+    verbose: int = 1
 
 
 @dataclass
@@ -101,8 +106,15 @@ def reshape_for_transformer(X: np.ndarray) -> np.ndarray:
     reshape(-1, 5, 5) yields (N, 5_channels, 5_bands) directly — no transpose.
     Attention operates across channels; each token carries the full spectral profile
     of one electrode.
+
+    With k feature maps (N, 25·k) each token concatenates the 5 bands of every
+    map → (N, 5, 5·k). With k=1 this is identical to v1.
     """
-    return X.reshape(-1, 5, 5)
+    n_maps = X.shape[-1] // 25
+    if n_maps == 1:
+        return X.reshape(-1, 5, 5)
+    grid = X.reshape(-1, n_maps, 5, 5).transpose(0, 2, 1, 3)
+    return grid.reshape(-1, 5, 5 * n_maps)
 
 
 def build_transformer_model(config: TransformerConfig) -> keras.Model:
@@ -118,9 +130,9 @@ def build_transformer_model(config: TransformerConfig) -> keras.Model:
       → Extract [CLS] token
       → LayerNorm → Dropout → Dense(3, softmax)
     """
-    inputs = layers.Input(shape=(5, 5))
+    inputs = layers.Input(shape=(5, 5 * config.n_feature_maps))
 
-    # Project each channel token from dim=5 (bands) to d_model
+    # Project each channel token from dim=5·k (bands × maps) to d_model
     x = layers.Dense(config.d_model)(inputs)
 
     # Learnable positional embedding — one vector per channel position
@@ -165,6 +177,7 @@ def train_transformer(
     X_test: np.ndarray,
     y_test: np.ndarray,
     config: TransformerConfig | None = None,
+    validation_data: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> TransformerResult:
     if config is None:
         config = TransformerConfig()
@@ -174,6 +187,12 @@ def train_transformer(
 
     X_train_t = reshape_for_transformer(X_train)
     X_test_t = reshape_for_transformer(X_test)
+
+    if validation_data is not None:
+        X_val, y_val = validation_data
+        fit_kwargs = {"validation_data": (reshape_for_transformer(X_val), y_val)}
+    else:
+        fit_kwargs = {"validation_split": config.validation_split}
 
     class_weight = None
     if config.use_class_weights:
@@ -209,12 +228,12 @@ def train_transformer(
     history = model.fit(
         X_train_t,
         y_train,
-        validation_split=config.validation_split,
+        **fit_kwargs,
         epochs=config.epochs,
         batch_size=config.batch_size,
         callbacks=[early_stopping, lr_scheduler],
         class_weight=class_weight,
-        verbose=1,
+        verbose=config.verbose,
     )
 
     test_loss, test_accuracy = model.evaluate(X_test_t, y_test, verbose=0)

@@ -8,11 +8,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from src.constants import LABEL_COLUMN, USER_COLUMN
+from src.constants import BLOCK_COLUMN, LABEL_COLUMN, POSITION_COLUMN, USER_COLUMN
 from src.data.loader import load_all_users
+from src.features.spectral_features import FEATURE_SETS, transform_features
 
 OutlierStrategy = Literal["none", "clip_iqr"]
-SplitStrategy = Literal["chronological", "random"]
+SplitStrategy = Literal["chronological", "random", "blocked_cv", "loso"]
+Normalization = Literal["global", "per_subject"]
+
+SPLIT_STRATEGIES = {"chronological", "random", "blocked_cv", "loso"}
+NORMALIZATIONS = {"global", "per_subject"}
 
 
 @dataclass
@@ -26,8 +31,51 @@ class BasePreprocessingConfig:
     iqr_multiplier: float = 2.5
     scale_data: bool = True
     split_strategy: SplitStrategy = "random"
+    subject: str | None = None
+    validation_size: float = 0.0
+
+    # Representação das features (ver src/features/spectral_features.py).
+    # "raw" reproduz exatamente a v1.
+    feature_set: str = "raw"
+
+    # "global": um único IQR/StandardScaler ajustado no treino inteiro (v1).
+    # "per_subject": limites de IQR e StandardScaler ajustados separadamente
+    # no treino de cada sujeito e aplicados só às amostras daquele sujeito.
+    # Equivale a uma sessão de calibração por usuário.
+    normalization: Normalization = "global"
+
+    # Validação cruzada por blocos de trials (split_strategy="blocked_cv").
+    # Os blocos de cada sujeito são agrupados em `cv_n_folds` folds
+    # contíguos; `cv_fold` é o fold de teste e o fold seguinte vira validação.
+    # `test_size` é ignorado nesse modo.
+    cv_n_folds: int = 6
+    cv_fold: int = 0
+    # Amostras descartadas do treino/validação em cada fronteira com o teste
+    # (e do treino na fronteira com a validação). Remove as vizinhas
+    # temporais que são quase cópias das amostras de teste.
+    purge_samples: int = 40
+    # Qual fold vira validação: "next" (fold seguinte, circular — padrão) ou
+    # "previous" (fold anterior, circular). Usado no diagnóstico sobre a
+    # proximidade temporal entre validação e teste.
+    cv_val_position: str = "next"
+
+    # Leave-one-subject-out (split_strategy="loso"). `loso_test_subject` fica
+    # inteiro no teste e nunca aparece no treino. Com `validation_size > 0`,
+    # `loso_val_subject` (padrão: o sujeito seguinte, circular) fica inteiro
+    # na validação, para o EarlyStopping escolher os pesos pelo que generaliza
+    # para uma pessoa não vista. `test_size` e o valor de `validation_size`
+    # são ignorados nesse modo. O leave-one-trial-out não precisa de modo
+    # próprio: é o "blocked_cv" com `cv_n_folds=12` (1 ciclo E→D→N por fold).
+    loso_test_subject: str | None = None
+    loso_val_subject: str | None = None
 
     def __post_init__(self) -> None:
+        if not (0.0 <= self.validation_size < 1.0):
+            raise ValueError(
+                f"`validation_size` deve estar em [0, 1) "
+                f"(0 desativa a validação explícita), "
+                f"recebido: {self.validation_size}"
+            )
         if not (0.0 < self.test_size < 1.0):
             raise ValueError(
                 f"`test_size` deve estar entre 0 e 1 (exclusivo), "
@@ -44,11 +92,54 @@ class BasePreprocessingConfig:
                 f"`imputation_strategy` inválida: '{self.imputation_strategy}'. "
                 f"Opções válidas: {valid_strategies}"
             )
-        if self.split_strategy not in {"chronological", "random"}:
+        if self.split_strategy not in SPLIT_STRATEGIES:
             raise ValueError(
                 f"`split_strategy` inválida: '{self.split_strategy}'. "
-                "Opções válidas: 'chronological', 'random'"
+                f"Opções válidas: {sorted(SPLIT_STRATEGIES)}"
             )
+        if self.feature_set not in FEATURE_SETS:
+            raise ValueError(
+                f"`feature_set` inválido: '{self.feature_set}'. "
+                f"Opções válidas: {FEATURE_SETS}"
+            )
+        if self.normalization not in NORMALIZATIONS:
+            raise ValueError(
+                f"`normalization` inválida: '{self.normalization}'. "
+                f"Opções válidas: {sorted(NORMALIZATIONS)}"
+            )
+        if self.cv_n_folds < 3:
+            raise ValueError(
+                f"`cv_n_folds` deve ser >= 3 (treino, validação e teste), "
+                f"recebido: {self.cv_n_folds}"
+            )
+        if not (0 <= self.cv_fold < self.cv_n_folds):
+            raise ValueError(
+                f"`cv_fold` deve estar em [0, {self.cv_n_folds}), "
+                f"recebido: {self.cv_fold}"
+            )
+        if self.cv_val_position not in {"next", "previous"}:
+            raise ValueError(
+                f"`cv_val_position` deve ser 'next' ou 'previous', "
+                f"recebido: {self.cv_val_position}"
+            )
+        if self.purge_samples < 0:
+            raise ValueError(
+                f"`purge_samples` deve ser >= 0, recebido: {self.purge_samples}"
+            )
+        if self.split_strategy == "loso":
+            if self.loso_test_subject is None:
+                raise ValueError(
+                    "`split_strategy='loso'` exige `loso_test_subject`."
+                )
+            if self.subject is not None:
+                raise ValueError(
+                    "`split_strategy='loso'` é do modelo agrupado e não pode "
+                    "ser combinado com `subject`."
+                )
+            if self.loso_val_subject == self.loso_test_subject:
+                raise ValueError(
+                    "`loso_val_subject` não pode ser o sujeito de teste."
+                )
 
 
 @dataclass
@@ -62,7 +153,9 @@ class BasePreprocessingResult:
 
     feature_columns: list[str]
 
-    scaler: StandardScaler | None
+    # StandardScaler único (normalization="global") ou dict sujeito → scaler
+    # (normalization="per_subject").
+    scaler: StandardScaler | dict[str, StandardScaler] | None
     imputer: SimpleImputer | None
 
     processed_train_dataframe: pd.DataFrame
@@ -70,9 +163,30 @@ class BasePreprocessingResult:
 
     preprocessing_report: dict
 
+    # Conjunto de validação explícito. Só é preenchido quando
+    # `validation_size > 0`; caso contrário permanece None e o Keras volta a
+    # fatiar a cauda do treino via `validation_split`.
+    X_val: np.ndarray | None = None
+    y_val: np.ndarray | None = None
+    users_val: np.ndarray | None = None
+
+    # Bloco de trial (0..35 por sujeito) e posição temporal de cada amostra
+    # dentro do sujeito. Servem para a acurácia por trial, para as timelines
+    # de predição e para auditar a CV por blocos.
+    blocks_train: np.ndarray | None = None
+    blocks_test: np.ndarray | None = None
+    blocks_val: np.ndarray | None = None
+    positions_train: np.ndarray | None = None
+    positions_test: np.ndarray | None = None
+    positions_val: np.ndarray | None = None
+
+    @property
+    def n_feature_maps(self) -> int:
+        return len(self.feature_columns) // 25
+
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    ignored_columns = {LABEL_COLUMN, USER_COLUMN}
+    ignored_columns = {LABEL_COLUMN, USER_COLUMN, BLOCK_COLUMN, POSITION_COLUMN}
 
     return [
         column
@@ -148,6 +262,45 @@ def remove_rows_without_label_or_user(df: pd.DataFrame) -> tuple[pd.DataFrame, i
     return df_clean, removed_rows
 
 
+def assign_trial_blocks(df: pd.DataFrame) -> pd.DataFrame:
+    """Numera os blocos contíguos de rótulo e a posição temporal por sujeito.
+
+    Cada sujeito foi gravado como uma sequência de trials, e cada trial é um
+    trecho contíguo com o mesmo rótulo (o ciclo Esquerda → Direita → Neutro
+    repetido 12×, totalizando 36 blocos). Um novo bloco começa sempre que o
+    rótulo muda. A posição é o índice da amostra dentro do sujeito, depois da
+    limpeza.
+    """
+    df = df.copy()
+    labels = df[LABEL_COLUMN]
+    users = df[USER_COLUMN]
+
+    new_block = (labels != labels.shift()) | (users != users.shift())
+    df[BLOCK_COLUMN] = new_block.groupby(users).cumsum().astype(int) - 1
+    df[POSITION_COLUMN] = df.groupby(USER_COLUMN).cumcount().astype(int)
+
+    return df
+
+
+def _index_chronological_split(
+    df: pd.DataFrame,
+    test_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Índices posicionais de treino/teste do corte cronológico por sujeito."""
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+
+    users = df[USER_COLUMN].to_numpy()
+
+    for user in sorted(np.unique(users)):
+        user_idx = np.flatnonzero(users == user)
+        n_train = int(len(user_idx) * (1 - test_size))
+        train_parts.append(user_idx[:n_train])
+        test_parts.append(user_idx[n_train:])
+
+    return np.concatenate(train_parts), np.concatenate(test_parts)
+
+
 def random_stratified_split(
     df: pd.DataFrame,
     feature_columns: list[str],
@@ -173,27 +326,263 @@ def chronological_split_by_user(
     feature_columns: list[str],
     test_size: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    train_parts: list[pd.DataFrame] = []
-    test_parts: list[pd.DataFrame] = []
+    train_idx, test_idx = _index_chronological_split(df, test_size)
 
-    for user in sorted(df[USER_COLUMN].unique()):
-        user_df = df[df[USER_COLUMN] == user]
-        n_train = int(len(user_df) * (1 - test_size))
-        train_parts.append(user_df.iloc[:n_train])
-        test_parts.append(user_df.iloc[n_train:])
+    train_df = df.iloc[train_idx]
+    test_df = df.iloc[test_idx]
 
-    train_df = pd.concat(train_parts, ignore_index=True)
-    test_df = pd.concat(test_parts, ignore_index=True)
+    return (
+        train_df[feature_columns].to_numpy(),
+        test_df[feature_columns].to_numpy(),
+        train_df[LABEL_COLUMN].to_numpy(),
+        test_df[LABEL_COLUMN].to_numpy(),
+        train_df[USER_COLUMN].to_numpy(),
+        test_df[USER_COLUMN].to_numpy(),
+    )
 
-    X_train = train_df[feature_columns].to_numpy()
-    y_train = train_df[LABEL_COLUMN].to_numpy()
-    users_train = train_df[USER_COLUMN].to_numpy()
 
-    X_test = test_df[feature_columns].to_numpy()
-    y_test = test_df[LABEL_COLUMN].to_numpy()
-    users_test = test_df[USER_COLUMN].to_numpy()
+def _chronological_validation_indices(
+    users_train: np.ndarray,
+    validation_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    train_indices: list[np.ndarray] = []
+    val_indices: list[np.ndarray] = []
 
-    return X_train, X_test, y_train, y_test, users_train, users_test
+    for user in sorted(np.unique(users_train)):
+        user_indices = np.flatnonzero(users_train == user)
+        n_val = int(len(user_indices) * validation_size)
+
+        if n_val == 0:
+            train_indices.append(user_indices)
+            continue
+
+        train_indices.append(user_indices[:-n_val])
+        val_indices.append(user_indices[-n_val:])
+
+    return (
+        np.concatenate(train_indices),
+        np.concatenate(val_indices) if val_indices else np.array([], dtype=int),
+    )
+
+
+def _random_validation_indices(
+    y_train: np.ndarray,
+    validation_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    train_idx, val_idx = train_test_split(
+        np.arange(len(y_train)),
+        test_size=validation_size,
+        random_state=random_state,
+        stratify=y_train,
+    )
+    return np.sort(train_idx), np.sort(val_idx)
+
+
+def carve_chronological_validation(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    users_train: np.ndarray,
+    validation_size: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Separa a cauda temporal do treino de CADA sujeito como validação.
+
+    `chronological_split_by_user` preserva a ordem cronológica dentro de cada
+    sujeito, então as últimas linhas do bloco de um sujeito são as mais
+    recentes dele. Fatiar por sujeito evita o problema do `validation_split` do
+    Keras, que pega a cauda do array concatenado e acabaria montando uma
+    validação composta por um único sujeito.
+
+    A validação sai de dentro do treino — o conjunto de teste não é tocado.
+    """
+    train_idx, val_idx = _chronological_validation_indices(
+        users_train, validation_size
+    )
+    return _apply_validation_indices(
+        X_train, y_train, users_train, train_idx=train_idx, val_idx=val_idx
+    )
+
+
+def carve_random_validation(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    users_train: np.ndarray,
+    validation_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Separa uma fração aleatória e estratificada do treino como validação."""
+    train_idx, val_idx = _random_validation_indices(
+        y_train, validation_size, random_state
+    )
+    return _apply_validation_indices(
+        X_train, y_train, users_train, train_idx=train_idx, val_idx=val_idx
+    )
+
+
+def _apply_validation_indices(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    users_train: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        X_train[train_idx],
+        y_train[train_idx],
+        users_train[train_idx],
+        X_train[val_idx],
+        y_train[val_idx],
+        users_train[val_idx],
+    )
+
+
+def _distance_to_range(positions: np.ndarray, start: int, end: int) -> np.ndarray:
+    """Distância (em amostras) de cada posição ao intervalo fechado [start, end]."""
+    return np.maximum(0, np.maximum(start - positions, positions - end))
+
+
+def blocked_cv_split(
+    df: pd.DataFrame,
+    n_folds: int,
+    fold: int,
+    use_validation: bool,
+    purge_samples: int,
+    val_position: str = "next",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Validação cruzada por blocos de trials, sujeito a sujeito.
+
+    Os blocos de cada sujeito são distribuídos em `n_folds` grupos contíguos
+    (com 36 blocos e 6 folds: 6 blocos = 2 ciclos completos E→D→N por fold, o
+    que mantém as classes balanceadas). O fold `fold` vira teste, o seguinte
+    (circular) vira validação e o resto é treino.
+
+    O purge descarta as amostras de treino/validação a até `purge_samples`
+    posições do teste, e as de treino a até `purge_samples` da validação.
+
+    Returns:
+        (índices de treino, índices de validação, índices de teste, info)
+    """
+    users = df[USER_COLUMN].to_numpy()
+    blocks = df[BLOCK_COLUMN].to_numpy()
+    positions = df[POSITION_COLUMN].to_numpy()
+
+    val_fold = (fold + (1 if val_position == "next" else -1)) % n_folds
+
+    train_parts: list[np.ndarray] = []
+    val_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    purged = 0
+    test_blocks: dict[str, list[int]] = {}
+
+    for user in sorted(np.unique(users)):
+        user_idx = np.flatnonzero(users == user)
+        user_blocks = blocks[user_idx]
+        user_positions = positions[user_idx]
+
+        n_blocks = int(user_blocks.max()) + 1
+        if n_blocks < n_folds:
+            raise ValueError(
+                f"Sujeito '{user}' tem {n_blocks} blocos, menos que "
+                f"{n_folds} folds."
+            )
+
+        block_fold = user_blocks * n_folds // n_blocks
+
+        is_test = block_fold == fold
+        is_val = (block_fold == val_fold) if use_validation else np.zeros_like(is_test)
+        is_train = ~is_test & ~is_val
+
+        test_pos = user_positions[is_test]
+        dist_test = _distance_to_range(user_positions, test_pos.min(), test_pos.max())
+
+        keep = np.ones(len(user_idx), dtype=bool)
+        keep &= ~((is_train | is_val) & (dist_test <= purge_samples))
+
+        if use_validation:
+            val_pos = user_positions[is_val]
+            dist_val = _distance_to_range(user_positions, val_pos.min(), val_pos.max())
+            keep &= ~(is_train & (dist_val <= purge_samples))
+
+        purged += int((~keep).sum())
+
+        train_parts.append(user_idx[is_train & keep])
+        val_parts.append(user_idx[is_val & keep])
+        test_parts.append(user_idx[is_test])
+        test_blocks[str(user)] = sorted(np.unique(user_blocks[is_test]).tolist())
+
+    info = {
+        "cv_n_folds": n_folds,
+        "cv_fold": fold,
+        "cv_val_fold": val_fold if use_validation else None,
+        "purge_samples": purge_samples,
+        "purged_rows": purged,
+        "test_blocks_per_user": test_blocks,
+    }
+
+    return (
+        np.concatenate(train_parts),
+        np.concatenate(val_parts),
+        np.concatenate(test_parts),
+        info,
+    )
+
+
+def loso_split(
+    df: pd.DataFrame,
+    test_subject: str,
+    val_subject: str | None,
+    use_validation: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Leave-one-subject-out: um sujeito inteiro no teste.
+
+    Com validação, outro sujeito inteiro (`val_subject`, ou o seguinte ao de
+    teste na ordem alfabética, circular) sai do treino e vira validação. O
+    treino fica com os sujeitos restantes. Não há purge: partições de
+    sujeitos diferentes não têm vizinhança temporal.
+
+    Returns:
+        (índices de treino, índices de validação, índices de teste, info)
+    """
+    users = df[USER_COLUMN].to_numpy()
+    subjects = sorted(np.unique(users).tolist())
+
+    if test_subject not in subjects:
+        raise ValueError(
+            f"Sujeito de teste '{test_subject}' não encontrado. "
+            f"Disponíveis: {subjects}"
+        )
+
+    if not use_validation:
+        val_subject = None
+    elif val_subject is None:
+        val_subject = subjects[(subjects.index(test_subject) + 1) % len(subjects)]
+    elif val_subject not in subjects:
+        raise ValueError(
+            f"Sujeito de validação '{val_subject}' não encontrado. "
+            f"Disponíveis: {subjects}"
+        )
+
+    is_test = users == test_subject
+    is_val = (
+        users == val_subject
+        if val_subject is not None
+        else np.zeros_like(is_test)
+    )
+
+    info = {
+        "loso_test_subject": test_subject,
+        "loso_val_subject": val_subject,
+        "loso_train_subjects": [
+            s for s in subjects if s not in (test_subject, val_subject)
+        ],
+    }
+
+    return (
+        np.flatnonzero(~is_test & ~is_val),
+        np.flatnonzero(is_val),
+        np.flatnonzero(is_test),
+        info,
+    )
 
 
 def remove_duplicate_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -242,6 +631,55 @@ def build_dataframe(
     return df
 
 
+def _per_subject(
+    fit_fn,
+    X_train: np.ndarray,
+    users_train: np.ndarray,
+    others: list[tuple[np.ndarray, np.ndarray]],
+    fit_unseen_on_self: bool = False,
+):
+    """Aplica `fit_fn` sujeito a sujeito: ajusta no treino, transforma o resto.
+
+    `fit_fn(X_user_train)` devolve uma função `transform(X)`. Retorna os
+    arrays transformados (treino primeiro, depois `others` na mesma ordem) e
+    o dict sujeito → objeto ajustado.
+
+    `fit_unseen_on_self` trata o sujeito que não tem treino (LOSO): em vez de
+    erro, o ajuste é feito nas amostras dele naquela partição. Só as features
+    entram na conta, nunca os rótulos — é uma calibração não supervisionada
+    do usuário novo, e precisa ser declarada como tal em qualquer resultado.
+    """
+    X_train_out = np.empty_like(X_train, dtype=float)
+    others_out = [np.empty_like(X, dtype=float) for X, _ in others]
+    fitted = {}
+
+    for user in sorted(np.unique(users_train)):
+        mask = users_train == user
+        transform, state = fit_fn(X_train[mask])
+        fitted[str(user)] = state
+        X_train_out[mask] = transform(X_train[mask])
+
+        for (X, users), out in zip(others, others_out):
+            other_mask = users == user
+            if other_mask.any():
+                out[other_mask] = transform(X[other_mask])
+
+    for (X, users), out in zip(others, others_out):
+        unseen = set(np.unique(users)) - set(np.unique(users_train))
+        if unseen and not fit_unseen_on_self:
+            raise ValueError(
+                "normalization='per_subject' exige que todo sujeito avaliado "
+                f"tenha dados de treino; sem treino: {sorted(unseen)}"
+            )
+        for user in sorted(unseen):
+            mask = users == user
+            transform, state = fit_fn(X[mask])
+            fitted[str(user)] = state
+            out[mask] = transform(X[mask])
+
+    return X_train_out, others_out, fitted
+
+
 def prepare_base_data(
     config: BasePreprocessingConfig | None = None,
 ) -> BasePreprocessingResult:
@@ -250,7 +688,21 @@ def prepare_base_data(
 
     df = load_all_users()
 
+    # O filtro por sujeito acontece antes de qualquer split, para que o track
+    # personalizado nunca enxergue dados dos outros sujeitos.
+    if config.subject is not None:
+        available_subjects = sorted(df[USER_COLUMN].unique())
+
+        if config.subject not in available_subjects:
+            raise ValueError(
+                f"Sujeito '{config.subject}' não encontrado. "
+                f"Disponíveis: {available_subjects}"
+            )
+
+        df = df[df[USER_COLUMN] == config.subject].reset_index(drop=True)
+
     report = {
+        "subject": config.subject,
         "initial_shape": df.shape,
         "initial_missing_values": int(df.isnull().sum().sum()),
     }
@@ -282,19 +734,100 @@ def prepare_base_data(
     report["split_strategy"] = config.split_strategy
     report["test_size"] = config.test_size
 
+    # Blocos e posição são calculados depois da limpeza, sobre a ordem
+    # cronológica original de cada sujeito.
+    df = assign_trial_blocks(df)
+    report["blocks_per_user"] = {
+        user: int(n)
+        for user, n in df.groupby(USER_COLUMN)[BLOCK_COLUMN].nunique().items()
+    }
+
+    # Transformação de features: por linha e sem estado, então é segura antes
+    # do split (nada é ajustado em dados de teste).
+    df, feature_columns = transform_features(df, config.feature_set)
+    report["feature_set"] = config.feature_set
+    report["n_features"] = len(feature_columns)
+    report["normalization"] = config.normalization
+
+    # Todos os splits são feitos por índice posicional sobre `df`, o que
+    # permite carregar bloco e posição junto com cada amostra.
+    use_validation = config.validation_size > 0.0
+    val_idx = None
+
     if config.split_strategy == "random":
-        X_train, X_test, y_train, y_test, users_train, users_test = random_stratified_split(
-            df,
-            feature_columns,
-            config.test_size,
-            config.random_state,
+        train_idx, test_idx = train_test_split(
+            np.arange(len(df)),
+            test_size=config.test_size,
+            random_state=config.random_state,
+            stratify=df[LABEL_COLUMN].to_numpy(),
         )
+        if use_validation:
+            inner_train, inner_val = _random_validation_indices(
+                df[LABEL_COLUMN].to_numpy()[train_idx],
+                config.validation_size,
+                config.random_state,
+            )
+            train_idx, val_idx = train_idx[inner_train], train_idx[inner_val]
+
+    elif config.split_strategy == "chronological":
+        train_idx, test_idx = _index_chronological_split(df, config.test_size)
+        if use_validation:
+            inner_train, inner_val = _chronological_validation_indices(
+                df[USER_COLUMN].to_numpy()[train_idx],
+                config.validation_size,
+            )
+            train_idx, val_idx = train_idx[inner_train], train_idx[inner_val]
+
+    elif config.split_strategy == "loso":
+        train_idx, val_idx, test_idx, loso_info = loso_split(
+            df,
+            test_subject=config.loso_test_subject,
+            val_subject=config.loso_val_subject,
+            use_validation=use_validation,
+        )
+        report.update(loso_info)
+        if not use_validation:
+            val_idx = None
+
     else:
-        X_train, X_test, y_train, y_test, users_train, users_test = chronological_split_by_user(
+        train_idx, val_idx, test_idx, cv_info = blocked_cv_split(
             df,
-            feature_columns,
-            config.test_size,
+            n_folds=config.cv_n_folds,
+            fold=config.cv_fold,
+            use_validation=use_validation,
+            purge_samples=config.purge_samples,
+            val_position=config.cv_val_position,
         )
+        report.update(cv_info)
+        if not use_validation:
+            val_idx = None
+
+    report.setdefault("purged_rows", 0)
+
+    def take(idx: np.ndarray, column: str | list[str]) -> np.ndarray:
+        return df.iloc[idx][column].to_numpy()
+
+    X_train = take(train_idx, feature_columns).astype(float)
+    X_test = take(test_idx, feature_columns).astype(float)
+    y_train = take(train_idx, LABEL_COLUMN)
+    y_test = take(test_idx, LABEL_COLUMN)
+    users_train = take(train_idx, USER_COLUMN)
+    users_test = take(test_idx, USER_COLUMN)
+    blocks_train = take(train_idx, BLOCK_COLUMN)
+    blocks_test = take(test_idx, BLOCK_COLUMN)
+    positions_train = take(train_idx, POSITION_COLUMN)
+    positions_test = take(test_idx, POSITION_COLUMN)
+
+    X_val = y_val = users_val = blocks_val = positions_val = None
+
+    if val_idx is not None:
+        X_val = take(val_idx, feature_columns).astype(float)
+        y_val = take(val_idx, LABEL_COLUMN)
+        users_val = take(val_idx, USER_COLUMN)
+        blocks_val = take(val_idx, BLOCK_COLUMN)
+        positions_val = take(val_idx, POSITION_COLUMN)
+
+    report["validation_size"] = config.validation_size
 
     report["missing_values_before_imputation_train"] = int(np.isnan(X_train).sum())
     report["missing_values_before_imputation_test"] = int(np.isnan(X_test).sum())
@@ -307,9 +840,15 @@ def prepare_base_data(
         X_train = imputer.fit_transform(X_train)
         X_test = imputer.transform(X_test)
 
+        if X_val is not None:
+            X_val = imputer.transform(X_val)
+
     else:
         missing_train = int(np.isnan(X_train).sum())
         missing_test = int(np.isnan(X_test).sum())
+
+        if X_val is not None:
+            missing_train += int(np.isnan(X_val).sum())
 
         if missing_train > 0 or missing_test > 0:
             raise ValueError(
@@ -337,14 +876,58 @@ def prepare_base_data(
         for user in sorted(np.unique(users_test))
     }
 
-    if config.outlier_strategy == "clip_iqr":
-        lower_bound, upper_bound = calculate_iqr_bounds(
-            X_train=X_train,
-            iqr_multiplier=config.iqr_multiplier,
-        )
+    if y_val is not None:
+        report["class_distribution_val"] = {
+            int(label): int((y_val == label).sum())
+            for label in sorted(np.unique(y_val))
+        }
+        report["samples_per_user_val"] = {
+            user: int((users_val == user).sum())
+            for user in sorted(np.unique(users_val))
+        }
 
-        X_train = clip_outliers(X_train, lower_bound, upper_bound)
-        X_test = clip_outliers(X_test, lower_bound, upper_bound)
+    others = [(X_test, users_test)]
+    if X_val is not None:
+        others.append((X_val, users_val))
+
+    # No LOSO os sujeitos de teste e validação não têm treino: a normalização
+    # por sujeito deles é ajustada nas próprias amostras, sem rótulos.
+    fit_unseen_on_self = config.split_strategy == "loso"
+    if fit_unseen_on_self and config.normalization == "per_subject":
+        report["unseen_subject_normalization"] = "transductive_unlabeled"
+
+    def unpack(others_out):
+        test = others_out[0]
+        val = others_out[1] if X_val is not None else None
+        return test, val
+
+    if config.outlier_strategy == "clip_iqr":
+        if config.normalization == "global":
+            lower_bound, upper_bound = calculate_iqr_bounds(
+                X_train=X_train,
+                iqr_multiplier=config.iqr_multiplier,
+            )
+
+            X_train = clip_outliers(X_train, lower_bound, upper_bound)
+            X_test = clip_outliers(X_test, lower_bound, upper_bound)
+
+            if X_val is not None:
+                X_val = clip_outliers(X_val, lower_bound, upper_bound)
+
+        else:
+            # Limites por sujeito: com sujeitos em escalas diferentes, um
+            # limite global cortaria um sujeito inteiro em vez de só a cauda.
+            def fit_iqr(X_user):
+                lower, upper = calculate_iqr_bounds(X_user, config.iqr_multiplier)
+                return (lambda X: clip_outliers(X, lower, upper)), (lower, upper)
+
+            X_train, others_out, _ = _per_subject(
+                fit_iqr, X_train, users_train, others, fit_unseen_on_self
+            )
+            X_test, X_val = unpack(others_out)
+            others = [(X_test, users_test)]
+            if X_val is not None:
+                others.append((X_val, users_val))
 
         report["outlier_strategy"] = "clip_iqr"
         report["iqr_multiplier"] = config.iqr_multiplier
@@ -360,14 +943,31 @@ def prepare_base_data(
     scaler = None
 
     if config.scale_data:
-        scaler = StandardScaler()
+        if config.normalization == "global":
+            scaler = StandardScaler()
 
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+
+            if X_val is not None:
+                X_val = scaler.transform(X_val)
+
+        else:
+            def fit_scaler(X_user):
+                user_scaler = StandardScaler().fit(X_user)
+                return user_scaler.transform, user_scaler
+
+            X_train, others_out, scaler = _per_subject(
+                fit_scaler, X_train, users_train, others, fit_unseen_on_self
+            )
+            X_test, X_val = unpack(others_out)
 
     report["scale_data"] = config.scale_data
     report["final_train_shape"] = X_train.shape
     report["final_test_shape"] = X_test.shape
+
+    if X_val is not None:
+        report["final_val_shape"] = X_val.shape
 
     processed_train_dataframe = build_dataframe(
         X=X_train,
@@ -396,4 +996,13 @@ def prepare_base_data(
         processed_train_dataframe=processed_train_dataframe,
         processed_test_dataframe=processed_test_dataframe,
         preprocessing_report=report,
+        X_val=X_val,
+        y_val=y_val,
+        users_val=users_val,
+        blocks_train=blocks_train,
+        blocks_test=blocks_test,
+        blocks_val=blocks_val,
+        positions_train=positions_train,
+        positions_test=positions_test,
+        positions_val=positions_val,
     )
