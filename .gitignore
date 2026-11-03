@@ -5,28 +5,18 @@ __pycache__/
 venv/
 env/
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Dados
+# Dataset (baixado do Kaggle; ver README)
 data/raw/*
-data/interim/*
-data/processed/*
-
-# Mantém as pastas no Git
 !data/raw/.gitkeep
-!data/interim/.gitkeep
-!data/processed/.gitkeep
 
-# Outputs pesados
-outputs/models/*
-outputs/metrics/*
-outputs/figures/*
-
-!outputs/models/.gitkeep
-!outputs/metrics/.gitkeep
-!outputs/figures/.gitkeep
+# Gerado ao rodar as etapas
+resultados/*
+!resultados/.gitkeep
 
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Documentos
+docs/*
+!docs/.gitkeep
