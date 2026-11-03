@@ -1,10 +1,19 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <title>BCI EEG — Resultados</title>
+    <script>
+      // Aplica o tema antes de desenhar a página (sem piscar): a escolha salva ou o tema do sistema.
+      (function () {
+        var tema = null;
+        try { tema = localStorage.getItem("tema"); } catch (e) {}
+        if (tema !== "claro" && tema !== "escuro")
+          tema = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "claro" : "escuro";
+        document.documentElement.dataset.theme = tema;
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
